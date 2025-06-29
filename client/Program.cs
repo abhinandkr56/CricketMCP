@@ -1,73 +1,72 @@
-﻿using Anthropic.SDK;
-using Microsoft.Extensions.AI;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Hosting;
+﻿using Microsoft.SemanticKernel;
+using Microsoft.SemanticKernel.ChatCompletion;
+using Microsoft.SemanticKernel.Connectors.OpenAI;
 using ModelContextProtocol.Client;
 
-var builder = Host.CreateApplicationBuilder(args);
+// Configure Semantic Kernel
+var builder = Kernel.CreateBuilder();
+builder.Services.AddOpenAIChatCompletion(
+    modelId: "llama3.2",
+    apiKey: null, // No API key needed for Ollama
+    endpoint: new Uri("http://localhost:11434/v1") // Ollama server endpoint
+);
+var kernel = builder.Build();
 
-builder.Configuration
-    .AddEnvironmentVariables()
-    .AddUserSecrets<Program>();
+// Set up MCP Client
+var (command, argument) = GetCommandAndArguments(args);
+await using IMcpClient mcpClient = await McpClientFactory.CreateAsync(
+    new StdioClientTransport(new()
+    {
+        Command = command,
+        Arguments =argument,
+        Name = "McpServer",
+    }));
 
-var (command, arguments) = GetCommandAndArguments(args);
+// Retrieve and load tools from the server
+IList<McpClientTool> tools = await mcpClient.ListToolsAsync().ConfigureAwait(false);
 
-var clientTransport = new StdioClientTransport(new()
-{
-    Name = "Demo Server",
-    Command = command,
-    Arguments = arguments,
-});
-
-await using var mcpClient = await McpClientFactory.CreateAsync(clientTransport);
-
-var tools = await mcpClient.ListToolsAsync();
+// List all available tools from the MCP server
+Console.WriteLine("\n\nAvailable MCP Tools:");
 foreach (var tool in tools)
 {
-    Console.WriteLine($"Connected to server with tools: {tool.Name}");
+    Console.WriteLine($"{tool.Name}: {tool.Description}");
 }
 
-using var anthropicClient = new AnthropicClient(new APIAuthentication(builder.Configuration["ANTHROPIC_API_KEY"]))
-    .Messages
-    .AsBuilder()
-    .UseFunctionInvocation()
-    .Build();
+// Register MCP tools with Semantic Kernel
+#pragma warning disable SKEXP0001 // Suppress diagnostics for experimental features
+kernel.Plugins.AddFromFunctions("McpTools", tools.Select(t => t.AsKernelFunction()));
+#pragma warning restore SKEXP0001
 
-var options = new ChatOptions
+// Chat loop
+Console.WriteLine("Chat with the AI. Type 'exit' to stop.");
+var history = new ChatHistory();
+history.AddSystemMessage("You are an assistant that can call MCP tools to process user queries.");
+
+// Get chat completion service
+var chatCompletionService = kernel.GetRequiredService<IChatCompletionService>();
+
+while (true)
 {
-    MaxOutputTokens = 1000,
-    ModelId = "claude-3-5-sonnet-20241022",
-    Tools = [.. tools]
-};
+    Console.Write("User > ");
+    var input = Console.ReadLine();
+    if (input?.Trim().ToLower() == "exit") break;
 
-Console.ForegroundColor = ConsoleColor.Green;
-Console.WriteLine("MCP Client Started!");
-Console.ResetColor();
+    history.AddUserMessage(input);
 
-PromptForInput();
-while(Console.ReadLine() is string query && !"exit".Equals(query, StringComparison.OrdinalIgnoreCase))
-{
-    if (string.IsNullOrWhiteSpace(query))
+    // Enable auto function calling
+    OpenAIPromptExecutionSettings openAIPromptExecutionSettings = new()
     {
-        PromptForInput();
-        continue;
-    }
+        ToolCallBehavior = ToolCallBehavior.AutoInvokeKernelFunctions
+    };
 
-    await foreach (var message in anthropicClient.GetStreamingResponseAsync(query, options))
-    {
-        Console.Write(message);
-    }
-    Console.WriteLine();
+    // Get the response from the AI
+    var result = await chatCompletionService.GetChatMessageContentAsync(
+        history,
+        executionSettings: openAIPromptExecutionSettings,
+        kernel: kernel);
 
-    PromptForInput();
-}
-
-static void PromptForInput()
-{
-    Console.WriteLine("Enter a command (or 'exit' to quit):");
-    Console.ForegroundColor = ConsoleColor.Cyan;
-    Console.Write("> ");
-    Console.ResetColor();
+    Console.WriteLine($"Assistant > {result.Content}");
+    history.AddMessage(result.Role, result.Content ?? string.Empty);
 }
 
 static (string command, string[] arguments) GetCommandAndArguments(string[] args)
